@@ -1,0 +1,248 @@
+---
+title: "Building features tables in different windows"
+date: "2020-04-07"
+author: "Moreno Martinovic"
+---
+
+***
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(biomaRt)
+library(GenomicRanges)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(stringr)
+library(magrittr)
+```
+&nbsp;  
+
+Reading HIV integrations data and control sites:  
+
+```{r}
+IS <- fread("is_hg38.txt")[, c(1:4)]
+colnames(IS) <- c("chr", "start", "end", "dataset")
+IS[, RMC := "Experimental"]
+setkey(IS, chr, start, end)
+
+RS <- fread("NewMatchedControlSites_hg38.txt")
+RS <- RS[order(chr, RMC, site), .(chr, start = site, end = site, RMC)]
+setkey(RS, chr, start, end)
+RS_list <- split(RS, by = "RMC")
+```
+&nbsp;  
+
+Getting hg38 genes and chr info:  
+
+```{r}
+chrlens <- seqlengths(seqinfo(BSgenome.Hsapiens.UCSC.hg38))
+chroms <- paste0("chr", c(as.character(1:22), "X", "Y"))
+```
+&nbsp;  
+
+***
+
+## 10 kb windows
+
+Creating tiles table from any file with 10kb windows:  
+
+```{r}
+tiles10kb <- fread("10kb_regions/H4K20me1_bio1_10kb.bed")[V1 %in% chroms, 1:3]
+colnames(tiles10kb) <- c("chr", "start", "end")
+tiles10kb[, start := as.integer(start + 1)]
+setkey(tiles10kb, chr, start, end)
+```
+&nbsp;  
+
+Overlapping integrations with tiles:  
+
+```{r}
+overlapTilesIS <- function(tiles, sites) {
+  setkey(sites, chr, start, end)
+  grp <- sites[, unique(RMC)]
+  ovlps <- foverlaps(tiles, sites)
+  zero_integrations <- ovlps[is.na(start), .(chr, start = i.start, end = i.end, numberOfIntegrations = 0, Sample = grp)]
+  ovlps <- ovlps[!is.na(start), .(numberOfIntegrations = .N, Sample = grp), .(chr, start = i.start, end = i.end)]
+  return(rbind(ovlps, zero_integrations))
+}
+
+featureTable10k <- rbind(overlapTilesIS(tiles10kb, IS),
+                         do.call(rbind, lapply(RS_list, function(x) overlapTilesIS(tiles10kb, x))))
+setkey(featureTable10k, Sample, chr, start, end)
+```
+&nbsp;  
+
+Read in coverage data and merge into feature table:  
+
+```{r}
+readCovFile <- function(filename) {
+  covFile <- fread(paste0("10kb_regions/", filename))[V1 %in% chroms, 1:5]
+  filetitle <- str_extract(filename, "^.+?(?=_)")
+  colnames(covFile) <- c("chr", "start", "end", paste0(filetitle, ".readCount"), paste0(filetitle, ".cov"))
+  covFile[, start := as.integer(start + 1)]
+  
+  ctrl_groups <- paste0("Control_", rep(0:10, each = nrow(covFile)))
+  
+  covFile <- covFile[rep(seq_len(nrow(covFile)), 11)]
+  covFile[, Sample := ctrl_groups]
+  covFile[Sample == "Control_0", Sample := "Experimental"]
+  setkey(covFile, Sample, chr, start, end)
+  return(covFile)
+}
+
+mergeToFeatures <- function(covfile, features) {
+  if (nrow(covfile) != nrow(features)) stop("Number of windows must be equal")
+  merged <- merge(features, covfile, by = c("chr", "start", "end", "Sample"))
+  setkey(merged, Sample, chr, start, end)
+  return(merged)
+}
+```
+
+## TSS
+
+Getting TSS from biomaRt and finding distance to nearest TSS from the middle of each tile:  
+
+```{r}
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+TSS <- data.table(getBM(attributes = c("chromosome_name", "transcription_start_site"),
+                        mart = ensembl))[chromosome_name %in% c(as.character(1:22), "X", "Y")]
+setnames(TSS, "chromosome_name", "chr")
+TSS[, chr := paste("chr", as.character(chr), sep = "")]
+
+featureTable10k[, distToNearestTSS := rep(mcols(distanceToNearest(makeGRangesFromDataFrame(tiles10kb[, .(chr, center = (start + end)/2)],
+                                                                                           start.field = "center",
+                                                                                           end.field = "center"),
+                                                                  makeGRangesFromDataFrame(TSS,
+                                                                                           start.field = "transcription_start_site",
+                                                                                           end.field = "transcription_start_site")))$distance,
+                                          11)]
+```
+& nbsp;  
+
+## Histone modifications ChIP-Seq
+
+### H4K20me1
+
+```{r}
+featureTable10k <- readCovFile("H4K20me1_bio1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+### H3K27ac
+
+```{r}
+featureTable10k <- readCovFile("H3K27ac_bio1_1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+### H3K26me3
+
+```{r}
+featureTable10k <- readCovFile("H3K36me3_bio1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+### H3K4me3
+
+```{r}
+featureTable10k <- readCovFile("H3K4me3_bio1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+### H3K9me2
+
+```{r}
+featureTable10k <- readCovFile("H3K9me2_bio1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+### ChIP-Seq input
+
+```{r}
+featureTable10k <- readCovFile("Input1_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+featureTable10k[, ":=" (Input1.readCount = Input1.readCount + 1, Input1.cov = Input1.cov + 0.001)]
+covcols <- grep("^H.+cov$", colnames(featureTable10k), value = TRUE)
+readcols <- grep("^H.+readCount$", colnames(featureTable10k), value = TRUE)
+featureTable10k[, which(colnames(featureTable10k) %in% covcols) := lapply(.SD, function(x) x/Input1.cov), .SDcols = covcols]
+featureTable10k[, which(colnames(featureTable10k) %in% readcols) := lapply(.SD, function(x) x/Input1.readCount), .SDcols = readcols]
+featureTable10k[, ":=" (Input1.readCount = NULL, Input1.cov = NULL)]
+```
+&nbsp;  
+
+## ATAC-seq
+
+```{r}
+featureTable10k <- readCovFile("ATACseq_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+&nbsp;  
+
+## RNA-Seq
+
+```{r}
+featureTable10k <- readCovFile("RNASeq41_10kb.bed") %>% mergeToFeatures(., featureTable10k)
+```
+
+***
+
+```{r}
+visData <- featureTable10k[Sample == "Experimental" & chr != "chrY", c(1:3, 5:6, 8, 10, 12, 14, 16, 18, 20)]
+setkey(visData, chr, start, end)
+genes_IS[, integrationDens := integrationsInGene/(end - start + 1)]
+genes_IS <- genes_IS[, .(chr, start, end, integrationsInGene, integrationDens, ensembl_gene_id, intGroup)]
+setkey(genes_IS, chr, start, end)
+visData <- foverlaps(visData, genes_IS)[!is.na(ensembl_gene_id), -c(2, 3)]
+setnames(visData, c("i.start", "i.end"), c("start", "end"))
+visData[is.na(integrationsInGene), integrationsInGene := 0]
+visData[is.na(integrationDens), integrationDens := 0]
+
+visData[integrationDens >= 2.2e-05, densgrp := "Najvecih 5%"]
+visData[integrationDens > 0 & integrationDens < 2.2e-05, densgrp := "0 - najvecih 5%"]
+visData[integrationDens == 0, densgrp := "0 integracija"]
+
+visData <- melt(visData,
+                id.vars = c("chr", "start", "end", "integrationsInGene", "numberOfIntegrations", "integrationDens", "distToNearestTSS",
+                            "ensembl_gene_id", "densgrp", "intGroup"),
+                variable.name = "mark",
+                value.name = "meanCov")
+
+visData[intGroup == "RIGs", intGroup := "RIG-ovi"]
+visData[intGroup == "One dataset", intGroup := "1 studija"]
+visData[intGroup == "Not integrated", intGroup := "Bez integracija"]
+
+ggplot(visData[!is.na(intGroup) & mark != "ATACseq.cov" & mark != "RNASeq41.cov"],
+       aes(x = mark, y = meanCov, fill = factor(intGroup))) +
+  geom_boxplot(outlier.color = NA) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = -45)) +
+  labs(x = "", y = "Pokrivenost po 10kb regijama", fill = "") +
+  coord_cartesian(ylim = c(0, 2))
+
+ggsave("Hmarks_Nlists.jpg", height = 4.5, width = 7)
+
+ggplot(visData[!is.na(intGroup) & mark != "ATACseq.cov" & mark != "RNASeq41.cov"],
+       aes(x = mark, y = meanCov, fill = factor(densgrp))) +
+  geom_boxplot(outlier.color = NA) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = -45)) +
+  labs(x = "", y = "Pokrivenost po 10kb regijama", fill = "Gustoca integracija u genima") +
+  coord_cartesian(ylim = c(0, 2))
+
+ggsave("Hmarks_intDens.jpg", height = 4.5, width = 7)
+
+########################################################################################################
+
+ggplot() +
+  # geom_segment(data = hg38_genes[chr != "chrY" & ensembl_gene_id %in% genidf[numberOfLists >= 2, Gene]],
+  #              aes(x = start, xend = end, y = 0, yend = 0), size = 10) +
+  geom_density(data = visData[mark == "H3K27ac.cov" | mark == "H3K9me2.cov" | mark == "RNASeq41.cov"],
+               aes(x = (start + end)/2,
+                   y = ..scaled..,
+                   colour = mark,
+                   weight = meanCov/sum(meanCov)),
+               adjust = 1/20) +
+  theme_light() +
+  facet_wrap(~ chr, scales = "free")
+
+ggsave("alldens.jpg", height=20, width = 30)
+```

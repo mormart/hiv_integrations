@@ -1,0 +1,984 @@
+---
+title: "Feature table by genes"
+date: "2020-05-04"
+author: "Moreno Martinovic"
+---
+
+```{r, echo=FALSE}
+library(data.table)
+library(biomaRt)
+library(stringr)
+library(ggplot2)
+library(viridis)
+library(GenomicRanges)
+library(corrplot)
+```
+&nbsp;  
+
+***
+
+## Defining recurrently integrated genes
+
+Reading HIV integrations data and control sites:  
+
+```{r}
+IS <- fread("is_hg38.txt", header = FALSE)[, c(1:4)]
+colnames(IS) <- c("chr", "start", "end", "i.id")
+IS[, i.dataset := str_extract(i.id, "^.+(?=_)")]
+setkey(IS, chr, start, end)
+
+# RS <- fread("NewMatchedControlSites_hg38.txt")
+# RS <- RS[, .(chr, start = site, end = site, RMC)]
+# RS_list <- split(RS, by = "RMC")
+```
+&nbsp;  
+
+Getting hg38 genes:  
+
+```{r}
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+for (i in 1:22) {
+  print(paste0("chr", i))
+  newgenes <- data.table(getBM(attributes = c("ensembl_gene_id", "chromosome_name", "start_position", "end_position",                                                                               "gene_biotype", "ensembl_exon_id", "strand"),
+                             filters = c("chromosome_name", "biotype"),
+                             values = list(as.character(i), c("protein_coding")),
+                             mart = ensembl))
+  if (i == 1) hg38_genes <- newgenes
+  else hg38_genes <- rbind(hg38_genes, newgenes)
+}
+
+setnames(hg38_genes, old = c("start_position", "end_position", "chromosome_name"), new = c("start", "end", "chr"))
+hg38_genes[, chr := paste("chr", as.character(chr), sep = "")]
+hg38_genes <- hg38_genes[, .(numberOfExons = .N), .(chr, start, end, ensembl_gene_id, gene_biotype, strand)]
+
+hg38_genes[, strand := as.character(strand)]
+hg38_genes[strand == "1", strand := "+"]
+hg38_genes[strand == "-1", strand := "-"]
+hg38_genes[, strand := as.factor(strand)]
+
+hg38_genes <- hg38_genes[gene_biotype == "protein_coding" & (end - start + 1) >= 10000]
+setkey(hg38_genes, chr, start, end)
+
+# fwrite(hg38_genes[order(as.integer(str_extract(chr, "([0-9])+")))][gene_biotype == "protein_coding" & (end - start + 1) >= 10000, .(chr, start, end)], "nimc/genes.txt", sep = "\t", col.names = FALSE)
+```
+&nbsp;  
+
+Number of datasets each integrated gene is in:  
+
+```{r}
+genes_IS <- foverlaps(IS, hg38_genes)[!is.na(ensembl_gene_id)]
+
+summary <- merge(IS[, .(IS.in.dataset = .N), i.dataset],
+                 genes_IS[, .(IS.in.genes = length(unique(i.id))), i.dataset], by = "i.dataset")
+summary[, perc.IS.in.genes := 100 * IS.in.genes/IS.in.dataset]
+summary[, total.genes := nrow(hg38_genes)]
+summary <- merge(summary,
+                 genes_IS[, .N, .(ensembl_gene_id, i.dataset)][, .(genes.with.IS = length(unique(ensembl_gene_id))), i.dataset],
+                 by = "i.dataset")
+summary[, perc.genes.with.IS := 100 * genes.with.IS/total.genes]
+
+
+numberOfLists <- unique(genes_IS[, .(ensembl_gene_id, i.dataset)])[, .(numberOfLists = .N), ensembl_gene_id]
+genes_IS <- merge(genes_IS, numberOfLists, by = "ensembl_gene_id")
+
+# genes_RS <- foverlaps(RS, hg38_genes)[!is.na(ensembl_gene_id)]
+# numberOfLists <- unique(genes_RS[, .(ensembl_gene_id, RMC)])[, .(numberOfLists = .N), ensembl_gene_id]
+# genes_RS <- merge(genes_RS, numberOfLists, by = "ensembl_gene_id")
+```
+& nbsp;  
+
+Number of integrations in each integrated gene:
+
+```{r}
+genes_IS[, integrationsInGene := .N, by = .(ensembl_gene_id, i.dataset)]
+genes_IS <- genes_IS[, -c(8:10)]
+
+# genes_RS[, integrationsInGene := .N, by = ensembl_gene_id]
+# genes_RS <- unique(genes_RS[, -c(8:10)])
+# genes_RS[, integrationsInGene := integrationsInGene/10]
+```
+& nbsp;  
+
+Merging with not integrated genes:
+
+```{r}
+notIntegrated <- hg38_genes[!(ensembl_gene_id %in% genes_IS[, unique(ensembl_gene_id)])]
+notIntegrated[, ":=" (numberOfLists = as.integer(0), integrationsInGene = as.integer(0), i.dataset = "none")]
+
+genes_IS <- rbind(genes_IS, notIntegrated)
+genes_IS[, gene.size := as.integer(end - start + 1)]
+genes_IS[, i.dataset := as.factor(i.dataset)]
+genes_IS <- unique(genes_IS)
+
+genes_IS[, integrationsInGene := sum(integrationsInGene), ensembl_gene_id]
+genes_IS <- unique(genes_IS[, -8])
+
+# poiss <- glm(numberOfLists ~ gene.size,
+#              family = "poisson",
+#              data = genes_IS)
+# 
+# poiss_preds <- predict.glm(poiss, newdata = genes_IS[, .(gene.size)], type = "response")
+# 
+# ggplot() +
+#   geom_point(data = genes_IS, aes(x = gene.size, y = numberOfLists), alpha = 0.2) +
+#   geom_point(data = NULL, aes(x = genes_IS[, gene.size], y = round(poiss_preds)), color = "red", alpha = 0.2) +
+#   theme_light()
+# 
+# genes_IS[numberOfLists == 0, intGroup := "Not integrated"]
+# genes_IS[numberOfLists > 1 & numberOfLists > round(poiss_preds), intGroup := "RIGs"]
+# genes_IS[which(numberOfLists < round(poiss_preds)), intGroup := "Not integrated"]
+# genes_IS[numberOfLists == 1, intGroup := "One dataset"]
+
+
+# hg38_genes <- hg38_genes[gene_biotype %in% genes_RS[, unique(gene_biotype)]]
+# notIntegrated <- hg38_genes[!(ensembl_gene_id %in% genes_RS[, unique(ensembl_gene_id)])]
+# notIntegrated[, ":=" (numberOfLists = as.integer(0), integrationsInGene = as.integer(0))]
+# 
+# genes_RS <- rbind(genes_RS, notIntegrated)
+# genes_RS <- genes_RS[order(chr, start, end)]
+
+# genes_IS[, integrationsInGene := integrationsInGene/(genes_RS$integrationsInGene + 1)]
+# genes_IS[, numberOfLists := numberOfLists/(genes_RS$numberOfLists + 1)]
+```
+&nbsp;  
+
+Defining recurrently integrated genes (RIGs) as genes in 2 or more datasets:  
+
+```{r}
+genes_IS[, intGroup := "One dataset"]
+genes_IS[numberOfLists >= 2, intGroup := "RIGs"]
+genes_IS[numberOfLists == 0, intGroup := "Not integrated"]
+
+setkey(genes_IS, chr, start, end)
+
+# fwrite(genes_IS[, 2:4], "onlygenes/genes.bed", sep = "\t", col.names = FALSE)
+```
+
+***
+
+## Making bed +- 2kb from TSS
+
+```{r}
+# TSS2kb <- 
+#   genes_IS[,
+#            {
+#              starts <- c(start - 2000, start + 1)
+#              ends <- c(start - 1, start + 2000)
+#              .(start = as.integer(starts), end = as.integer(ends))
+#            },
+#            by = .(ensembl_gene_id, chr)]
+
+# fwrite(TSS2kb[, c(2:4, 1)], "onlygenes/tss2kb.bed", sep = "\t", col.names = FALSE)
+```
+
+```{r}
+# genes_by_perc <- 
+#   hg38_genes[,
+#              {
+#                flankleft_starts <- as.integer(seq(start - 2000, start, length.out = 34))
+#                flankleft_ends <- flankleft_starts[-34] + diff(flankleft_starts) - 1
+#                flankleft_starts <- flankleft_starts[-34]
+#                
+#                starts <- as.integer(seq(start, end + 1, length.out = 101))
+#                ends <- starts[-101] + diff(starts) - 1
+#                starts <- starts[-101]
+#                
+#                flankright_starts <- as.integer(seq(end + 1, end + 2001, length.out = 34))
+#                flankright_ends <- flankright_starts[-34] + diff(flankright_starts) - 1
+#                flankright_starts <- flankright_starts[-34]
+#                
+#                .(start = c(flankleft_starts, starts, flankright_starts),
+#                  end = c(flankleft_ends, ends, flankright_ends))
+#              },
+#              by = .(chr, gene_start = start, gene_end = end, strand, ensembl_gene_id)]
+# 
+# genes_by_perc <- genes_by_perc[order(as.integer(str_extract(chr, "([0-9])+")))]
+# genes_by_perc[, end := as.integer(end)]
+```
+
+***
+
+## Building a feature table for genes
+
+### ChIP-seq
+
+```{r}
+readCovFile <- function(filename) {
+  covFile <- fread(paste0("byperc/", filename), header = FALSE)[order(as.integer(str_extract(V1, "([0-9])+")), V2), c(1:3, 5)]
+  filetitle <- str_extract(filename, "^.+?(?=\\.)")
+  colnames(covFile) <- c("chr", "start", "end", paste0(filetitle, ".TSS"))
+  return(covFile)
+}
+
+genes_by_perc <- 
+  hg38_genes[(end - start + 1) >= 10000 & gene_biotype == "protein_coding",
+             {
+              flankleft_starts <- as.integer(seq(start - 2000, start, length.out = 34))
+              flankleft_ends <- flankleft_starts[-34] + diff(flankleft_starts) - 1
+              flankleft_starts <- flankleft_starts[-34]
+              
+              starts <- as.integer(seq(start, end + 1, length.out = 101))
+              ends <- starts[-101] + diff(starts) - 1
+              starts <- starts[-101]
+              
+              flankright_starts <- as.integer(seq(end + 1, end + 2001, length.out = 34))
+              flankright_ends <- flankright_starts[-34] + diff(flankright_starts) - 1
+              flankright_starts <- flankright_starts[-34]
+                
+              .(start = c(flankleft_starts, starts, flankright_starts),
+                end = c(flankleft_ends, ends, flankright_ends))
+             },
+             by = .(chr, gene_start = start, gene_end = end, strand, ensembl_gene_id)]
+ 
+genes_by_perc <- genes_by_perc[order(as.integer(str_extract(chr, "([0-9])+")), start)]
+genes_by_perc[, end := as.integer(end)]
+
+genes_by_perc <- genes_by_perc[, .(chr, start, end, strand, ensembl_gene_id)]
+
+# file1 <- readCovFile("H3K27ac.genes_by_perc.bed")
+# genes_by_perc <- cbind(genes_by_perc, file1[, .(H3K27ac.TSS)])
+
+# file1 <- readCovFile("H3K36me3.genes_by_perc.bed")
+# genes_by_perc <- cbind(genes_by_perc, file1[, .(H3K36me3.TSS)])
+# 
+# file1 <- readCovFile("H3K9me2.genes_by_perc.bed")
+# genes_by_perc <- cbind(genes_by_perc, file1[, .(H3K9me2.TSS)])
+
+file1 <- readCovFile("H3K4me3.genes_by_perc.bed")
+genes_by_perc <- cbind(genes_by_perc, file1[, .(H3K4me3.TSS)])
+
+# file1 <- readCovFile("H4K20me1.genes_by_perc.bed")
+# genes_by_perc <- cbind(genes_by_perc, file1[, .(H4K20me1.TSS)])
+
+# genes_by_perc[,
+#               6:7 := lapply(.SD, function(x) x/(readCovFile("Input1.genes_by_perc.bed")[, Input1.TSS] + 1)),
+#               .SDcols = c(6:7)]
+# 
+tsspos <- genes_by_perc[strand == "+", lapply(.SD[32:34], mean), by = ensembl_gene_id, .SDcols = colnames(genes_by_perc)[6]]
+# bodypos <- genes_by_perc[strand == "+", lapply(.SD[35:133], mean), by = ensembl_gene_id, .SDcols = colnames(genes_by_perc)[6:10]]
+# ratiopos <- cbind(tsspos[, .(ensembl_gene_id)], tsspos[, c(-1)]/(bodypos[, c(-1)] + 1))
+
+tssneg <- genes_by_perc[strand == "-", lapply(.SD[134:136], mean), by = ensembl_gene_id, .SDcols = colnames(genes_by_perc)[6]]
+# bodyneg <- genes_by_perc[strand == "-", lapply(.SD[33:131], mean), by = ensembl_gene_id, .SDcols = colnames(genes_by_perc)[6:10]]
+# rationeg <- cbind(tssneg[, .(ensembl_gene_id)], tssneg[, c(-1)]/(bodyneg[, c(-1)] + 1))
+
+tss <- rbind(tsspos, tssneg)
+
+featureTable <- copy(genes_IS)
+featureTable <- merge(featureTable, tss, by = "ensembl_gene_id")
+```
+
+```{r}
+readPeakFile <- function(filename) {
+ peakFile <- fread(paste0("newpeaks/", filename))[, c(1:4, 7)]
+ filetitle <- str_extract(filename, "^.+?(?=_)")
+ colnames(peakFile) <- c("chr", "peak_start", "peak_end", "peak_id", paste0(filetitle, ".FE"))
+ setkey(peakFile, chr, peak_start, peak_end)
+ return(peakFile)
+}
+
+peaksToFeatures <- function(genes, filename, features) {
+ filetitle <- str_extract(filename, "^.+?(?=_)")
+ ovlps <- foverlaps(genes, readPeakFile(filename))
+ zeroes <- ovlps[is.na(peak_id), -c(2:5)]
+ zeroes[, numberOfPeaks := 0]
+ # zeroes[, meanFE := 0]
+ # ovlps <- ovlps[!is.na(peak_id),
+ #                .(numberOfPeaks = length(unique(peak_id)), meanFE = mean(get(paste0(filetitle,  ".FE")))),
+ #                by = .(ensembl_gene_id, chr, start, end, hgnc_symbol, gene_biotype, numberOfLists, integrationsInGene, intGroup)]
+ ovlps <- ovlps[!is.na(peak_id),
+                .(numberOfPeaks = length(unique(peak_id))),
+                by = .(ensembl_gene_id, chr, start, end, numberOfExons, gene_biotype, numberOfLists, integrationsInGene, intGroup, strand, gene.size)]
+ ovlps <- rbind(ovlps, zeroes)
+ # setnames(ovlps, c("numberOfPeaks", "meanFE"), c(paste0(filetitle, ".numberOfPeaks"), paste0(filetitle, ".meanFE")))
+ setnames(ovlps, "numberOfPeaks", paste0(filetitle, ".numberOfPeaks"))
+ setkey(ovlps, chr, start, end)
+ # feature_tbl <- cbind(features,
+ #                      ovlps[, (ncol(ovlps) - 1):ncol(ovlps)])
+ # feature_tbl <- cbind(features, ovlps[, .SD, .SDcols = c(ncol(ovlps))])
+ feature_tbl <- merge(features, ovlps, by = colnames(features)[1:11])
+ return(feature_tbl)
+}
+
+# featureTable <- copy(genes_IS)
+featureTable <- peaksToFeatures(genes_IS, "H3K27ac_peaks.broadPeak", featureTable)
+featureTable <- peaksToFeatures(genes_IS, "H3K36me3_peaks.broadPeak", featureTable)
+# featureTable <- peaksToFeatures(genes_IS, "H3K4me3_peaks.broadPeak", featureTable)
+featureTable <- peaksToFeatures(genes_IS, "H3K9me2_peaks.broadPeak", featureTable)
+featureTable <- peaksToFeatures(genes_IS, "H4K20me1_peaks.broadPeak", featureTable)
+featureTable <- peaksToFeatures(genes_IS, "ATACseq_peaks.broadPeak", featureTable)
+colnames(featureTable)[13:17] <- c("H3K27ac", "H3K36me3", "H3K9me2", "H4K20me1", "ATACseq")
+```
+
+
+```{r}
+# readCovFile <- function(filename) {
+#   covFile <- fread(paste0("onlygenes/", filename), header = FALSE)[, c(1:3, 5)]
+#   filetitle <- str_extract(filename, "^.+?(?=_)")
+#   colnames(covFile) <- c("chr", "start", "end", paste0(filetitle, ".cov"))
+#   setkey(covFile, chr, start, end)
+#   return(covFile)
+# }
+# 
+# addToFeatures <- function(filename, features) {
+#   cbind(features, readCovFile(filename)[, 4])
+# }
+# 
+# featureTable <- copy(genes_IS)
+# featureTable <- addToFeatures("H3K27ac.genes.bed", featureTable)
+# featureTable <- addToFeatures("H3K36me3.genes.bed", featureTable)
+# featureTable <- addToFeatures("H3K9me2.genes.bed", featureTable)
+# featureTable <- addToFeatures("H3K4me3.genes.bed", featureTable)
+# featureTable <- addToFeatures("H4K20me1.genes.bed", featureTable)
+# colnames(featureTable)[10:14] <- c("H3K27ac", "H3K36me3", "H3K9me2", "H3K4me3", "H4K20me1")
+# featureTable[, gene.size := (end - start + 1)]
+# 
+# featureTable[,
+#              10:14 := lapply(.SD, function(x) log2(x/(readCovFile("Input.genes.bed")[, NA.cov] + 0.001) + 1)),
+#              .SDcols = c(10:14)]
+# 
+# featureTableLong <- melt(featureTable[chr != "chrY"],
+#                          id.vars = c("ensembl_gene_id", "chr", "start", "end", "hgnc_symbol", "gene_biotype", "numberOfLists",
+#                                      "integrationsInGene", "intGroup", "gene.size"),
+#                          variable.name = "mark",
+#                          value.name = "covLog2FC")
+# 
+# ggplot() +
+#   geom_boxplot(data = featureTableLong[intGroup != "One dataset"],
+#                aes(x = mark, y = covLog2FC, fill = intGroup),
+#                outlier.color = NA) +
+#   theme_light() +
+#   coord_cartesian(ylim = c(0, 3)) +
+#   labs(x = "", y = "Fold change from input", fill = "Integration group")
+```
+
+### RNA-seq
+
+```{r}
+rnaseq41 <- fread("rnaseq/RNAseq41_ReadsPerGene.out.tab")[-c(1:4), .(ensembl_gene_id = str_extract(V1, "^.+(?=\\.)"), readCounts41 = V2)]
+rnaseq42 <- fread("rnaseq/RNAseq42_ReadsPerGene.out.tab")[-c(1:4), .(ensembl_gene_id = str_extract(V1, "^.+(?=\\.)"), readCounts42 = V2)]
+rnaseq44 <- fread("rnaseq/RNAseq44_ReadsPerGene.out.tab")[-c(1:4), .(ensembl_gene_id = str_extract(V1, "^.+(?=\\.)"), readCounts44 = V2)]
+
+featureTable <- unique(merge(featureTable, rnaseq41, by = "ensembl_gene_id"))
+featureTable <- unique(merge(featureTable, rnaseq42, by = "ensembl_gene_id"))
+featureTable <- unique(merge(featureTable, rnaseq44, by = "ensembl_gene_id"))
+
+featureTable[, readCountsLog := log2(rowMeans(.SD) + 1), .SDcols = c("readCounts41", "readCounts42", "readCounts44")]
+featureTable <- featureTable[, -c(18:20)]
+```
+
+### SEs
+
+```{r}
+cd4_se <- fread("cd4_primary_cells_SE.bed", header = FALSE)[, 1:3]
+colnames(cd4_se) <- c("chr", "start", "end")
+featureTable[, distToSE := mcols(distanceToNearest(makeGRangesFromDataFrame(featureTable[, .(chr, start, end)]),
+                                                   makeGRangesFromDataFrame(cd4_se)))$distance]
+featureTable[, SE := "noSE"]
+featureTable[distToSE < 10000, SE := "SE"]
+```
+
+### Hi-C
+
+```{r}
+hic_clusters <- fread("hic_clusters_COR_new.txt")
+setnames(hic_clusters, c("start", "end"), c("clust.start", "clust.end"))
+setkey(hic_clusters, chr, clust.start, clust.end)
+
+# featureTable <- cbind(featureTable[order(as.integer(str_extract(chr, "([0-9])+")), start)], hic_clusters[, .(compartment)])
+
+midgenes <- featureTable[, .(chr, start = (end + start)/2, end = (end + start)/2, ensembl_gene_id)]
+setkey(midgenes, chr, start, end)
+
+ovlps <- foverlaps(hic_clusters, midgenes)[!is.na(compartment), .(compartment = compartment[1]), by = ensembl_gene_id]
+featureTable <- merge(featureTable, ovlps, by = "ensembl_gene_id")
+# featureTable[, compartment := paste0("compartment", compartment)]
+
+cmptsizes <- hic_clusters[, .(cmptsize = sum(clust.end - clust.start + 1)), compartment]
+featureTable <- merge(featureTable, cmptsizes, by = "compartment")
+
+unique(featureTable[, sum(integrationsInGene)/cmptsize, compartment])
+```
+
+***
+
+## Visualizations
+
+```{r}
+featureTableLong <- melt(featureTable[, 1:21],
+                         id.vars = c("ensembl_gene_id", "chr", "start", "end", "numberOfExons", "gene_biotype", "numberOfLists",
+                                     "integrationsInGene", "intGroup", "strand", "compartment", "SE", "gene.size"),
+                         variable.name = "mark",
+                         value.name = "value")
+
+
+ggplot() +
+  geom_boxplot(data = featureTableLong[intGroup != "One dataset" & mark != "distToSE"],
+              aes(x = intGroup, y = value, fill = intGroup),
+              outlier.color = NA) +
+  theme_light() +
+  labs(x = "", y = "Value", fill = "Integration group") +
+  facet_wrap(~mark, scales = "free") +
+  theme(legend.position = "none")
+
+ggplot() +
+ geom_boxplot(data = featureTableLong[intGroup != "One dataset"],
+              aes(x = mark, y = value/gene.size, fill = intGroup),
+              outlier.color = NA) +
+ theme_light() +
+ coord_cartesian(ylim = c(0, 1.5e-03)) +
+ labs(x = "", y = "Number of peaks scaled by gene size", fill = "Integration group")
+
+
+ggplot(featureTable, aes(x = intGroup, y = readCountsLog, fill = intGroup)) +
+  geom_boxplot(outlier.colour = NA) +
+  theme_light() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "log2 read count per gene")
+
+ggplot(featureTable, aes(x = as.factor(numberOfLists), y = readCountsLog, fill = as.factor(numberOfLists))) +
+  geom_boxplot() +
+  theme_light() +
+  theme(legend.position = "none") +
+  labs(x = "Number of lists", y = "log2 read count per gene") +
+  scale_fill_viridis_d()
+
+
+ggplot(featureTable, aes(x = intGroup, y = distToSE, fill = intGroup)) +
+  geom_boxplot(outlier.color = NA) +
+  coord_cartesian(ylim = c(0, 1e+07)) +
+  theme_light() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "Distance to nearest SE") +
+  scale_fill_viridis_d()
+
+
+###################################################################################
+
+ggplot(featureTable[intGroup != "One dataset" & gene_biotype == "protein_coding" & gene.size >= 10000,
+                    .(sum(integrationsInGene/gene.size)), by = .(compartment, cmptsize)],
+       aes(x = compartment, y = V1/cmptsize, fill = compartment)) +
+  geom_bar(stat = "identity")
+
+
+ggplot(featureTableLong[intGroup != "One dataset" & gene_biotype == "protein_coding" & gene.size >= 10000],
+       aes(x = compartment, y = value/gene.size, fill = compartment)) +
+  geom_boxplot(outlier.color = NA) +
+  theme_light() +
+  theme(legend.position = "none") +
+  coord_cartesian(ylim = c(0, 1e-03)) +
+  facet_wrap(~mark) +
+  scale_fill_viridis_d()
+
+ggsave("asdf.jpg", plot = ggplot(featureTable[intGroup != "One dataset" & gene_biotype == "protein_coding" & gene.size >= 10000],
+                                 aes(x = intGroup, y = (H3K27ac * readCountsLog)/gene.size))
+       + geom_boxplot() + facet_wrap(~compartment) + coord_cartesian(ylim = c(0, 0.01)),
+       width = 15, height = 15)
+
+ggsave("asdf2.jpg", plot = ggplot(featureTable[intGroup != "One dataset", sum(integrationsInGene)/sum(gene.size), .(compartment, SE)],
+                                 aes(x = SE, y = V1))
+       + geom_bar(stat = "identity") + facet_wrap(~compartment),
+       width = 15, height = 15)
+
+ggsave("asdf3.jpg",
+       plot = ggplot(featureTable[intGroup != "One dataset", sum(intGroup == "RIGs")/(sum(intGroup == "Not integrated") + sum(intGroup == "RIGs")), .(compartment, SE)],
+                     aes(x = SE, y = V1)) +
+         geom_bar(stat = "identity") +
+         coord_cartesian(ylim = c(0, 2)) +
+         facet_wrap(~compartment),
+       width = 15, height = 15)
+
+featureTable[intGroup != "One dataset", .N, .(intGroup, compartment, SE)]
+
+ggplot(featureTable[intGroup != "One dataset"], aes(x = compartment, y = numberOfExons)) + geom_boxplot()
+ggplot(featureTable[intGroup != "One dataset"], aes(x = compartment, y = gene.size)) + geom_boxplot() + coord_cartesian(ylim = c(0, 1000000))
+
+ggplot(featureTable[intGroup != "One dataset"], aes(x = intGroup, y = gene.size)) + geom_boxplot(outlier.color = NA) + coord_cartesian(ylim = c(0, 400000))
+```
+
+***
+
+## Building a model
+
+```{r}
+library(caret)
+# set.seed(1)
+
+featureData <- featureTable[gene_biotype == "protein_coding", -c(2:7)]
+featureData <- featureData[intGroup != "One dataset" & !is.na(intGroup)]
+featureData[intGroup == "Not integrated", intGroup := "not_integrated"]
+featureData[intGroup == "RIGs", intGroup := "integrated"]
+featureData[, intGroup := as.factor(intGroup)]
+featureData[, compartment := as.factor(compartment)]
+featureData[, numberOfLists := as.factor(numberOfLists)]
+featureData[, SE := as.factor(SE)]
+
+featureData[, numberOfExons := numberOfExons/gene.size]
+featureData[,
+            c(8:13) := lapply(.SD, function(x) x/gene.size),
+            .SDcols = c(8:13)]
+
+featureData[, clustSE := as.factor(paste0(compartment, SE))]
+
+featureData <- featureData[, -c(3, 4)]
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+jpeg("corplot1.jpg", height = 1000, width = 1000, quality = 300)
+corrplot(cor(featureData[, c(2, 3, 5:12)]),
+         method = "shade", col = col(200), order = "hclust", addrect = 3,
+         number.cex = 1, addCoef.col = "black", tl.col = "black", tl.srt = 90)
+dev.off()
+
+featureData[, size.category := gene.size%/%20000]
+samplesizes <- table(featureData[intGroup == "integrated", size.category])
+samplesizes <- samplesizes[-which(!(as.integer(names(samplesizes)) %in% featureData[intGroup == "not_integrated", size.category]))]
+
+for (i in 1:length(samplesizes)) {
+  dt <- featureData[intGroup == "not_integrated" & size.category == as.integer(names(samplesizes))[i]]
+  rows <- sample(1:nrow(dt), samplesizes[i], replace = TRUE)
+  if (i == 1) nonintdata <- dt[rows]
+  else nonintdata <- rbind(nonintdata, dt[rows])
+}
+
+featureData <- rbind(featureData[intGroup == "integrated"], nonintdata)
+featureData[, size.category := NULL]
+
+jpeg("corplot2.jpg", height = 1000, width = 1000, quality = 300)
+corrplot(cor(featureData[, c(2, 3, 5:12)]),
+         method = "shade", col = col(200), order = "hclust", addrect = 3,
+         number.cex = 1, addCoef.col = "black", tl.col = "black", tl.srt = 90)
+dev.off()
+
+
+data_idx <- createDataPartition(featureData$intGroup, p = 0.75, list = FALSE)
+train_data <- featureData[data_idx]
+test_data <- featureData[-data_idx]
+```
+
+
+### Random forest (ranger)
+
+```{r}
+# set.seed(2)
+
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE,
+                     verboseIter = TRUE)
+
+tune <- expand.grid(mtry = 6, min.node.size = 1, splitrule = "extratrees")
+
+##############################################################################################################
+
+rrfFit <- train(x = train_data[, -c(4, 14, 15)],
+                y = train_data$intGroup,
+                method = "ranger",
+                num.trees = 1000,
+                importance = "permutation",
+                sample.fraction = 0.63,
+                metric = "ROC",
+                trControl = ctrl,
+                tuneGrid = tune)
+
+preds <- as.data.table(predict(rrfFit, newdata = test_data, type = "prob"))
+preds[, predicted_class := "not_integrated"]
+preds[integrated > 0.5, predicted_class := "integrated"]
+confusionMatrix(as.factor(preds$predicted_class), test_data$intGroup, mode = "prec_recall")
+
+##############################################################################################################
+
+nSEFit <- train(x = train_data[, -c(1, 4, 12:15)],
+                y = train_data$intGroup,
+                method = "ranger",
+                num.trees = 1000,
+                importance = "permutation",
+                sample.fraction = 0.63,
+                metric = "ROC",
+                trControl = ctrl,
+                tuneGrid = tune)
+
+SEpreds <- as.data.table(predict(nSEFit, newdata = test_data, type = "prob"))
+SEpreds[, predicted_class := "not_integrated"]
+SEpreds[integrated > 0.5, predicted_class := "integrated"]
+confusionMatrix(as.factor(SEpreds$predicted_class), test_data$intGroup, mode = "prec_recall")
+
+##############################################################################################################
+
+nH3Fit <- train(x = train_data[, -c(4:10, 14, 15)],
+                y = train_data$intGroup,
+                method = "ranger",
+                num.trees = 1000,
+                importance = "permutation",
+                sample.fraction = 0.63,
+                metric = "ROC",
+                trControl = ctrl,
+                tuneGrid = tune)
+
+H3preds <- as.data.table(predict(nH3Fit, newdata = test_data, type = "prob"))
+H3preds[, predicted_class := "not_integrated"]
+H3preds[integrated > 0.5, predicted_class := "integrated"]
+confusionMatrix(as.factor(H3preds$predicted_class), test_data$intGroup, mode = "prec_recall")
+
+##############################################################################################################
+
+nlRFit <- train(x = train_data[, -c(4, 11, 14, 15)],
+                y = train_data$intGroup,
+                method = "ranger",
+                num.trees = 1000,
+                importance = "permutation",
+                sample.fraction = 0.63,
+                metric = "ROC",
+                trControl = ctrl,
+                tuneGrid = tune)
+
+NLpreds <- as.data.table(predict(nlRFit, newdata = test_data, type = "prob"))
+NLpreds[, predicted_class := "not_integrated"]
+NLpreds[integrated > 0.5, predicted_class := "integrated"]
+confusionMatrix(as.factor(NLpreds$predicted_class), test_data$intGroup, mode = "prec_recall")
+
+##############################################################################################################
+
+genFit <- train(x = train_data[, .(H3K36me3, H3K27ac, H3K4me3.TSS, H3K9me2, H4K20me1, ATACseq)],
+                y = train_data$intGroup,
+                method = "ranger",
+                num.trees = 1000,
+                importance = "permutation",
+                sample.fraction = 0.63,
+                metric = "ROC",
+                trControl = ctrl,
+                tuneGrid = tune)
+
+genpreds <- as.data.table(predict(genFit, newdata = test_data, type = "prob"))
+genpreds[, predicted_class := "not_integrated"]
+genpreds[integrated > 0.5, predicted_class := "integrated"]
+confusionMatrix(as.factor(genpreds$predicted_class), test_data$intGroup, mode = "prec_recall")
+```
+
+```{r}
+
+proc1 <- pROC::roc(response = test_data$intGroup,
+                   predictor = preds$integrated,
+                   levels = c("not_integrated", "integrated"))
+
+proc2 <- pROC::roc(response = test_data$intGroup,
+                   predictor = genpreds$integrated,
+                   levels = c("not_integrated", "integrated"))
+
+proc3 <- pROC::roc(response = test_data$intGroup,
+                   predictor = SEpreds$integrated,
+                   levels = c("not_integrated", "integrated"))
+
+proc4 <- pROC::roc(response = test_data$intGroup,
+                   predictor = H3preds$integrated,
+                   levels = c("not_integrated", "integrated"))
+
+proc5 <- pROC::roc(response = test_data$intGroup,
+                   predictor = NLpreds$integrated,
+                   levels = c("not_integrated", "integrated"))
+
+##############################################################################################################
+
+proc1_coords <- as.data.table(pROC::coords(proc1, transpose = FALSE))
+proc1_coords[, curve := "Potpuni model"]
+proc2_coords <- as.data.table(pROC::coords(proc2, transpose = FALSE))
+proc2_coords[, curve := "Samo ChIP-seq"]
+proc3_coords <- as.data.table(pROC::coords(proc3, transpose = FALSE))
+proc3_coords[, curve := "Bez Hi-C i SE"]
+proc4_coords <- as.data.table(pROC::coords(proc4, transpose = FALSE))
+proc4_coords[, curve := "Bez ChIP-seq"]
+proc5_coords <- as.data.table(pROC::coords(proc5, transpose = FALSE))
+proc5_coords[, curve := "Bez RNA-seq"]
+
+proc_coords <- rbind(proc5_coords, proc1_coords, proc2_coords, proc3_coords, proc4_coords)
+
+
+ggplot() +
+  geom_line(data = proc_coords, aes(x = -specificity, y = sensitivity, color = as.factor(curve)), size = 1) +
+  scale_x_continuous(labels = c(1, 0.75, 0.5, 0.25, 0.00), name = "Specifičnost") +
+  scale_y_continuous(name = "Osjetljivost") +
+  labs(title = "ROC krivulje različitih modela") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+ggsave("roc.jpg", width = 9, height = 6)
+
+
+importances <- data.table(names(ranger::importance(rrfFit$finalModel)), ranger::importance(rrfFit$finalModel))[order(-V2)]
+
+ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Značajnost", y = "", title = "Potpuni model") +
+  scale_fill_viridis_c() +
+  theme(legend.position = "none")
+
+ggsave("importances_full.jpg", height = 6, width = 9)
+
+importances <- data.table(names(ranger::importance(nSEFit$finalModel)), ranger::importance(nSEFit$finalModel))[order(-V2)]
+
+ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Značajnost", y = "", title = "Model bez Hi-C i SE") +
+  scale_fill_viridis_c() +
+  theme(legend.position = "none")
+
+ggsave("importances_nohic.jpg", height = 6, width = 9)
+
+importances <- data.table(names(ranger::importance(nH3Fit$finalModel)), ranger::importance(nH3Fit$finalModel))[order(-V2)]
+
+ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Značajnost", y = "", title = "Model bez ChIP-seq") +
+  scale_fill_viridis_c() +
+  theme(legend.position = "none")
+
+ggsave("importances_nochip.jpg", height = 6, width = 9)
+
+importances <- data.table(names(ranger::importance(nlRFit$finalModel)), ranger::importance(nlRFit$finalModel))[order(-V2)]
+
+ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Značajnost", y = "", title = "Model bez RNA-seq") +
+  scale_fill_viridis_c() +
+  theme(legend.position = "none")
+
+ggsave("importances_norna.jpg", height = 6, width = 9)
+
+importances <- data.table(names(ranger::importance(genFit$finalModel)), ranger::importance(genFit$finalModel))[order(-V2)]
+
+ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Značajnost", y = "", title = "Samo s ChIP-seq") +
+  scale_fill_viridis_c() +
+  theme(legend.position = "none")
+
+ggsave("importances_chiponly.jpg", height = 6, width = 9)
+
+aucs <- data.table(proc1$auc, proc2$auc, proc3$auc, proc4$auc, proc5$auc)
+colnames(aucs) <- c("Potpuni model", "Samo ChIP-seq", "Bez Hi-C/SE", "Bez ChIP-seq", "Bez RNA-seq")
+
+pvals <- matrix(nrow = 5, ncol = 5)
+colnames(pvals) <- rownames(pvals) <- colnames(aucs)
+proclist <- list(proc1, proc2, proc3, proc4, proc5)
+
+for (i in 1:5) {
+  for(j in 1:5) {
+    pval <- pROC::roc.test(proclist[[i]], proclist[[j]])$p.value
+    pvals[i, j] <- round(pval, 3)
+  }
+}
+
+
+prcplotdata <- function(preds) {
+  prc <- PRROC::pr.curve(preds[which(test_data$intGroup == "integrated"), integrated],
+                       preds[which(test_data$intGroup == "not_integrated"), integrated],
+                       curve = TRUE)
+  pr_plot <- as.data.table(prc$curve)
+}
+
+pr1 <- prcplotdata(preds)[, -3]
+pr1[, V3 := "Potpuni model"]
+pr2 <- prcplotdata(genpreds)[, -3]
+pr2[, V3 := "Samo ChIP-seq"]
+pr3 <- prcplotdata(SEpreds)[, -3]
+pr3[, V3 := "Bez HiC/SE"]
+pr4 <- prcplotdata(H3preds)[, -3]
+pr4[, V3 := "Bez ChIP-seq"]
+pr5 <- prcplotdata(NLpreds)[, -3]
+pr5[, V3 := "Bez RNA-seq"]
+
+pr <- rbind(pr1, pr2, pr3, pr4, pr5)
+
+ggplot() +
+  geom_line(data = pr, aes(x = V1, y = V2, color = V3)) +
+  theme_minimal() +
+  labs(x = "Negativna prediktivna vrijednost", y = "Pozitivna prediktivna vrijednost", title = "PR krivulje") +
+  theme(legend.title = element_blank())
+
+ggsave("prcurve.jpg", height = 6, width = 9)
+
+
+PRROC::pr.curve(preds[which(test_data$intGroup == "integrated"), integrated],
+                       preds[which(test_data$intGroup == "not_integrated"), integrated],
+                       curve = TRUE)
+
+PRROC::pr.curve(SEpreds[which(test_data$intGroup == "integrated"), integrated],
+                       SEpreds[which(test_data$intGroup == "not_integrated"), integrated],
+                       curve = TRUE)
+```
+
+
+### 10 sample repeats
+
+```{r}
+library(caret)
+set.seed(1)
+
+featureData <- featureTable[gene_biotype == "protein_coding", -c(2:7)]
+featureData <- featureData[intGroup != "One dataset" & !is.na(intGroup)]
+featureData[intGroup == "Not integrated", intGroup := "not_integrated"]
+featureData[intGroup == "RIGs", intGroup := "integrated"]
+featureData[, intGroup := as.factor(intGroup)]
+featureData[, compartment := as.factor(compartment)]
+featureData[, numberOfLists := as.factor(numberOfLists)]
+featureData[, SE := as.factor(SE)]
+
+featureData[, numberOfExons := numberOfExons/gene.size]
+featureData[,
+            c(8:13) := lapply(.SD, function(x) x/gene.size),
+            .SDcols = c(8:13)]
+
+featureData[, clustSE := as.factor(paste0(compartment, SE))]
+
+featureData <- featureData[, -c(3, 4)]
+
+
+for (iter in 1:10) {
+
+  featureData[, size.category := gene.size%/%20000]
+  samplesizes <- table(featureData[intGroup == "integrated", size.category])
+  samplesizes <- samplesizes[-which(!(as.integer(names(samplesizes)) %in% featureData[intGroup == "not_integrated", size.category]))]
+  
+  for (i in 1:length(samplesizes)) {
+    dt <- featureData[intGroup == "not_integrated" & size.category == as.integer(names(samplesizes))[i]]
+    rows <- sample(1:nrow(dt), samplesizes[i], replace = TRUE)
+    if (i == 1) nonintdata <- dt[rows]
+    else nonintdata <- rbind(nonintdata, dt[rows])
+  }
+  
+  featureData <- rbind(featureData[intGroup == "integrated"], nonintdata)
+  featureData[, size.category := NULL]
+  
+  
+  data_idx <- createDataPartition(featureData$intGroup, p = 0.75, list = FALSE)
+  train_data <- featureData[data_idx]
+  test_data <- featureData[-data_idx]
+  
+  
+  ctrl <- trainControl(method = "cv",
+                       number = 10,
+                       summaryFunction = twoClassSummary,
+                       classProbs = TRUE,
+                       verboseIter = FALSE)
+  
+  tune <- expand.grid(mtry = 6, min.node.size = 1, splitrule = "extratrees")
+  
+  ##############################################################################################################
+  
+  rrfFit <- train(x = train_data[, -c(4, 14, 15)],
+                  y = train_data$intGroup,
+                  method = "ranger",
+                  num.trees = 1000,
+                  importance = "permutation",
+                  sample.fraction = 0.63,
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneGrid = tune)
+  
+  preds <- as.data.table(predict(rrfFit, newdata = test_data, type = "prob"))
+  
+  ##############################################################################################################
+  
+  nSEFit <- train(x = train_data[, -c(1, 4, 12:15)],
+                  y = train_data$intGroup,
+                  method = "ranger",
+                  num.trees = 1000,
+                  importance = "permutation",
+                  sample.fraction = 0.63,
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneGrid = tune)
+  
+  SEpreds <- as.data.table(predict(nSEFit, newdata = test_data, type = "prob"))
+  
+  ##############################################################################################################
+  
+  nH3Fit <- train(x = train_data[, -c(4:10, 14, 15)],
+                  y = train_data$intGroup,
+                  method = "ranger",
+                  num.trees = 1000,
+                  importance = "permutation",
+                  sample.fraction = 0.63,
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneGrid = tune)
+  
+  H3preds <- as.data.table(predict(nH3Fit, newdata = test_data, type = "prob"))
+  
+  ##############################################################################################################
+  
+  nlRFit <- train(x = train_data[, -c(4, 11, 14, 15)],
+                  y = train_data$intGroup,
+                  method = "ranger",
+                  num.trees = 1000,
+                  importance = "permutation",
+                  sample.fraction = 0.63,
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneGrid = tune)
+  
+  NLpreds <- as.data.table(predict(nlRFit, newdata = test_data, type = "prob"))
+  
+  ##############################################################################################################
+  
+  genFit <- train(x = train_data[, .(H3K36me3, H3K27ac, H3K4me3.TSS, H3K9me2, H4K20me1, ATACseq)],
+                  y = train_data$intGroup,
+                  method = "ranger",
+                  num.trees = 1000,
+                  importance = "permutation",
+                  sample.fraction = 0.63,
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneGrid = tune)
+  
+  genpreds <- as.data.table(predict(genFit, newdata = test_data, type = "prob"))
+  
+  ##############################################################################################################
+  
+  proc1 <- pROC::roc(response = test_data$intGroup,
+                     predictor = preds$integrated,
+                     levels = c("not_integrated", "integrated"))
+  
+  proc2 <- pROC::roc(response = test_data$intGroup,
+                     predictor = genpreds$integrated,
+                     levels = c("not_integrated", "integrated"))
+  
+  proc3 <- pROC::roc(response = test_data$intGroup,
+                     predictor = SEpreds$integrated,
+                     levels = c("not_integrated", "integrated"))
+  
+  proc4 <- pROC::roc(response = test_data$intGroup,
+                     predictor = H3preds$integrated,
+                     levels = c("not_integrated", "integrated"))
+  
+  proc5 <- pROC::roc(response = test_data$intGroup,
+                     predictor = NLpreds$integrated,
+                     levels = c("not_integrated", "integrated"))
+  
+  importances <- data.table(names(ranger::importance(rrfFit$finalModel)), ranger::importance(rrfFit$finalModel))[order(-V2)]
+  ggplot(importances, aes(x = V2, y = reorder(V1, V2), fill = 1:nrow(importances))) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(x = "Značajnost", y = "", title = "Potpuni model") +
+    scale_fill_viridis_c() +
+    theme(legend.position = "none")
+  ggsave(paste0("importances_iter", iter, ".jpg"), height = 6, width = 9)
+  
+  
+  if (iter == 1) aucs <- data.table(proc1$auc, proc2$auc, proc3$auc, proc4$auc, proc5$auc)
+  else aucs <- rbind(aucs, data.table(proc1$auc, proc2$auc, proc3$auc, proc4$auc, proc5$auc))
+
+}
+
+colnames(aucs) <- c("Potpuni model", "Samo ChIP-seq", "Bez Hi-C/SE", "Bez ChIP-seq", "Bez RNA-seq")
+
+aucs[, lapply(.SD, mean)]
+```
+

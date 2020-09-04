@@ -1,0 +1,146 @@
+
+```{r}
+set.seed(1)
+
+weightedF1 <- function(preds, labels) {
+  conf <- confusionMatrix(preds, labels, mode = "prec_recall")
+  if (length(levels(labels)) > 2) return(sum(conf$byClass[, "F1"] * table(labels) / length(preds), na.rm = TRUE))
+  else return(sum(conf$byClass["F1"], na.rm = TRUE))
+}
+
+calcMAE <- function(preds, labels) {
+  sum(abs(preds - labels)/length(preds))
+}
+
+PPS <- function(dt, ncv = 5) {
+  ctrl <- trainControl(method = "none")
+  tune_class <- expand.grid(mtry = 1, splitrule = c("gini"), min.node.size = 1)
+  tune_reg <- expand.grid(mtry = 1, splitrule = c("variance"), min.node.size = 1)
+  n <- nrow(dt)
+  scores <- matrix(nrow = ncol(dt), ncol = ncol(dt))
+  rownames(scores) <- colnames(dt)
+  colnames(scores) <- colnames(dt)
+
+  for (varname in colnames(dt)) {
+    print(varname)
+    response <- dt[, get(varname)]
+    
+    if (is.factor(response)) {
+       baseline <- as.factor(rep(names(which.max(table(response))), n))
+       baseF1 <- weightedF1(preds = baseline, labels = response)
+  
+       for (i in 1:ncol(dt)) {
+         predictor <- dt[, .SD, .SDcols = c(i)]
+         rrfFit <- train(x = predictor,
+                         y = response,
+                         method = "ranger",
+                         num.trees = 500,
+                         importance = "none",
+                         trControl = ctrl,
+                         tuneGrid = tune_class)
+         j <- which(colnames(dt) == varname)
+         scores[i, j] <- (weightedF1(preds = rrfFit$finalModel$predictions, labels = response) - baseF1)/(1 - baseF1)
+        }
+      }
+    
+    if (is.numeric(response)) {
+       baseline <- rep(median(response), n)
+       baseMAE <- calcMAE(preds = baseline, labels = response)
+  
+       for (i in 1:ncol(dt)) {
+         predictor <- dt[, .SD, .SDcols = c(i)]
+         rrfFit <- train(x = predictor,
+                         y = response,
+                         method = "ranger",
+                         num.trees = 500,
+                         importance = "none",
+                         trControl = ctrl,
+                         tuneGrid = tune_reg)
+         j <- which(colnames(dt) == varname)
+         MAEscore <- calcMAE(preds = rrfFit$finalModel$predictions, labels = response)
+         if (MAEscore > baseMAE) scores[i, j] <- 0
+         else scores[i, j] <- 1 - MAEscore/baseMAE
+        }
+      }
+    }
+  return(scores)
+  }
+
+ppscores <- PPS(featureData[, c(1, 2, 3, 5:12, 15)])
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+jpeg("ppscore.jpg", height = 1000, width = 1000, quality = 300)
+corrplot(ppscores[-12, -12], is.corr = FALSE,
+         method = "shade", col = col(200),
+         number.cex = 1, addCoef.col = "black", tl.col = "black", tl.srt = 90)
+dev.off()
+```
+
+
+```{r}
+set.seed(1)
+
+weightedF1 <- function(preds, labels) {
+  conf <- confusionMatrix(preds, labels, mode = "prec_recall")
+  if (length(levels(labels)) > 2) return(sum(conf$byClass[, "F1"] * table(labels) / length(preds), na.rm = TRUE))
+  else return(sum(conf$byClass["F1"], na.rm = TRUE))
+}
+
+calcMAE <- function(preds, labels) {
+  sum(abs(preds - labels)/length(preds))
+}
+
+PPS <- function(dt, ncv = 5) {
+  ctrl <- trainControl(method = "cv", number = ncv, verboseIter = FALSE)
+  tune <- expand.grid(shrinkage = 0.1, n.minobsinnode = 1, interaction.depth = 1, n.trees = 150)
+  n <- nrow(dt)
+  scores <- matrix(nrow = ncol(dt), ncol = ncol(dt))
+  rownames(scores) <- colnames(dt)
+  colnames(scores) <- colnames(dt)
+
+  for (varname in colnames(dt)) {
+    print(varname)
+    response <- dt[, get(varname)]
+    
+    if (is.factor(response)) {
+       baseline <- as.factor(rep(names(which.max(table(response))), n))
+       baseF1 <- weightedF1(preds = baseline, labels = response)
+  
+       for (i in 1:ncol(dt)) {
+         predictor <- dt[, .SD, .SDcols = c(i)]
+         rrfFit <- train(x = predictor,
+                         y = response,
+                         method = "gbm",
+                         verbose = FALSE,
+                         trControl = ctrl,
+                         tuneGrid = tune)
+         j <- which(colnames(dt) == varname)
+         scores[i, j] <- (weightedF1(preds = rrfFit$finalModel$predictions, labels = response) - baseF1)/(1 - baseF1)
+        }
+      }
+    
+    if (is.numeric(response)) {
+       baseline <- rep(median(response), n)
+       baseMAE <- calcMAE(preds = baseline, labels = response)
+  
+       for (i in 1:ncol(dt)) {
+         predictor <- dt[, .SD, .SDcols = c(i)]
+         rrfFit <- train(x = predictor,
+                         y = response,
+                         method = "gbm",
+                         verbose = FALSE,
+                         trControl = ctrl,
+                         tuneGrid = tune)
+         j <- which(colnames(dt) == varname)
+         MAEscore <- calcMAE(preds = rrfFit$finalModel$predictions, labels = response)
+         if (MAEscore > baseMAE) scores[i, j] <- 0
+         else scores[i, j] <- 1 - MAEscore/baseMAE
+        }
+      }
+    }
+  return(scores)
+  }
+
+
+# pheatmap::pheatmap(ppscores[-c(1, 2, 3), -c(1, 2, 3)])
+```

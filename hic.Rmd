@@ -1,0 +1,648 @@
+
+```{r}
+library(data.table)
+library(ggplot2)
+```
+
+```{r}
+iterCorrection <- function(M, max_iter = 200, threshold = 1e-06) {
+  m <- dim(M)[1]
+  bias <- rep(0, m)
+  old_bias_change <- bias
+  
+  for (i in 1:max_iter) {
+    
+    sums <- rowSums(M, na.rm = TRUE)
+    bias_change <- sums/mean(sums, na.rm = TRUE)
+    bias_change[bias_change == 0] <- 1
+    M <- M / (bias_change %*% t(bias_change))
+    bias <- bias * bias_change
+    
+    if (i == max_iter) {
+      message(paste0("Did not converge in ", max_iter, " iterations"))
+      break
+    }
+    
+    if (sum(abs(bias_change - old_bias_change), na.rm = TRUE) < threshold) {
+      message(paste0("Converged in ", i, " iterations"))
+      break
+    }
+    
+    old_bias_change <- bias_change
+  }
+  
+  return(M)
+}
+```
+
+```{r}
+bin_ends <- fread("jurkat_binends_100K.txt")
+chr_idx <- bin_ends[, .(last = .N), chr]
+chr_idx[, last := cumsum(last)]
+chr_idx[, first := c(1, last[1:23] + 1)]
+setcolorder(chr_idx, c("chr", "first", "last"))
+chr_idx <- chr_idx[1:22]
+
+# indices <- chr_idx[, .(idx = seq(first, last)), by = chr]
+```
+
+```{r}
+m <- fread("jurkat_ALL_100K.txt", header = FALSE)
+M <- as.matrix(m)
+M <- M[1:chr_idx[chr == "chr22", last], 1:chr_idx[chr == "chr22", last]]
+
+M[M > quantile(M, 0.99, na.rm = TRUE)] <- quantile(M, 0.99, na.rm = TRUE)
+colvars <- as.data.table(M)[, sapply(.SD, function(x) var(x, na.rm = TRUE))]
+lowsignal <- which(colvars < quantile(colvars, 0.02, na.rm = TRUE))
+M <- M[-lowsignal, -lowsignal]
+    
+M <- iterCorrection(M)
+
+# corM <- cor(M, method = "spearman")
+# corM[corM > quantile(corM, 0.9, na.rm = TRUE)] <- quantile(corM, 0.9, na.rm = TRUE)
+
+# for (i in 1:23) corM[chr_idx[i, first]:chr_idx[i, last], chr_idx[i, first]:chr_idx[i, last]] <- 0
+# diag(corM) <- 0
+# corM[is.na(corM)] <- 0
+```
+
+```{r}
+pheatmap::pheatmap(log(M + 1), cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 30, height = 30, silent = FALSE, legend = FALSE, border_color = NA, file = "jurkattest.jpg",
+                   color = colorRampPalette(c("black", "firebrick3", "#FFD6CC"))(50))
+
+pheatmap::pheatmap(corM_scaled, cluster_cols = FALSE, cluster_rows = TRUE, cutree_rows = 6, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 30, height = 30, silent = FALSE, legend = FALSE, border_color = NA, file = "jurkatcortest3.jpg",
+                   color = colorRampPalette(c("#ff3300", "white"))(50))
+```
+
+```{r}
+rescale <- function(v, from, to) {
+  (to - from) * (v - max(v)) / (max(v) - min(v)) + 1
+}
+
+corM_scaled <- rescale(corM, -1, 1)
+diag(corM_scaled) <- -1
+
+mat <- data.table(count = c(corM_scaled), region1 = rep(1:dim(M)[1], dim(M)[1]), region2 = rep(1:dim(M)[1], each = dim(M)[1]))
+
+b <- ggplot(mat) +
+  geom_point(aes(x = (region1 + region2)/2, y = abs(region2 - region1), colour = count), shape = 18) +
+  theme_void() +
+  scale_colour_gradientn(colours = c("white", "red")) +
+  theme(legend.position = "none")
+ggsave(filename = "jurkatcortest.jpg", plot = b, device = "jpeg", height = 10, width = 20, units = "in", limitsize = FALSE)
+```
+
+***
+
+```{r}
+L <- igraph::graph_from_adjacency_matrix(corM_scaled, weighted = TRUE, mode = "undirected")
+L <- igraph::laplacian_matrix(L, normalized = F)
+decomp <- eigen(L)
+
+fiedler <- decomp$vectors[, length(decomp$values) - which(diff(round(sort(decomp$values), 8) > 0) == 1)]
+tads <- rleid(fiedler > 0)
+
+tads <- as.data.table(tads)
+tads <- tads[, .N, .(tad_id = tads)][, .(tad_id, N, tad_end = cumsum(N))]
+tads[, tad_start := as.integer(tad_end - N + 1)]
+
+mat <- data.table(count = c(corM_scaled), region1 = rep(1:dim(corM_scaled)[1], dim(corM_scaled)[1]), region2 = rep(1:dim(corM_scaled)[1], each = dim(corM_scaled)[1]))
+
+# b <- ggplot() +
+#   geom_point(data = mat, aes(x = (region1 + region2)/2, y = abs(region2 - region1), colour = count), shape = 18) +
+#   geom_segment(data = tads, aes(x = tad_start - 4, xend = (tad_start + tad_end)/2 - 4, y = 0, yend = abs(tad_end - tad_start)), size = 0.1, colour = "yellow") +
+#   geom_segment(data = tads, aes(x = tad_end - 4, xend = (tad_start + tad_end)/2 - 4, y = 0, yend = abs(tad_end - tad_start)), size = 0.1, colour = "yellow") +
+#   theme_void() +
+#   scale_colour_gradientn(colours = c("#0a004d", "red", "white")) +
+#   theme(legend.position = "none")
+
+b <- ggplot() +
+  geom_tile(data = mat, aes(x = region1, y = -region2, fill = count)) +
+  geom_segment(data = tads, aes(x = tad_end, xend = tad_end, y = -tad_start, yend = -tad_end), size = 0.1) +
+  geom_segment(data = tads, aes(x = tad_start, xend = tad_end, y = -tad_start, yend = -tad_start), size = 0.1) +
+  geom_segment(data = tads, aes(x = tad_start, xend = tad_start, y = -tad_start, yend = -tad_end), size = 0.1) +
+  geom_segment(data = tads, aes(x = tad_start, xend = tad_end, y = -tad_end, yend = -tad_end), size = 0.1) +
+  theme_void() +
+  scale_fill_gradientn(colours = c("white", "red")) +
+  theme(legend.position = "none")
+
+ggsave(filename = "tadtest2.jpg", plot = b, device = "jpeg", height = 9.04666667, width = 9.04666667, dpi = 600, units = "in", limitsize = FALSE)
+```
+
+```{r}
+cl <- hclust(d = as.dist(-log(M + 1)))
+
+matdt <- as.data.table(expand.grid(cutree(cl, 6), cutree(cl, 6)))
+matdt <- matdt[, region1 := rep(1:dim(M)[1], dim(M)[1])]
+matdt <- matdt[, region2 := rep(1:dim(M)[1], each = dim(M)[1])]
+matdt[Var1 != Var2, grp := "diff"]
+for (i in 1:6) matdt[Var1 == i & Var2 == i, grp := paste0("clust", i)]
+
+p <- ggplot(matdt[grp != "diff"]) +
+  geom_point(aes(x = region1, y = -region2, color = grp), shape = 15) +
+  theme_void() +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+ggsave(filename = "test6_1.jpg", plot = p, device = "jpeg", height = 20, width = 20, units = "in")
+
+regions <- bin_ends[, .(start = as.integer(c(1, end + 1)[1:length(end)]), end), by = chr]
+regions <- regions[1:chr_idx[chr == "chr22", last]]
+regions <- regions[-lowsignal]
+regions <- cbind(regions, as.factor(cutree(cl, 6)))
+setnames(regions, "V2", "compartment")
+
+fwrite(regions, "../hic_clusters_NEW.txt", sep = "\t")
+```
+
+
+```{r}
+library(dbscan)
+
+cl <- hdbscan(corM_scaled, minPts = 80)
+cl$membership_prob
+
+plot(cl)
+
+matdt <- as.data.table(expand.grid(c(cl$cluster), c(cl$cluster)))
+matdt <- matdt[, region1 := rep(1:dim(M)[1], dim(M)[1])]
+matdt <- matdt[, region2 := rep(1:dim(M)[1], each = dim(M)[1])]
+matdt[Var1 != Var2, grp := "diff"]
+for (i in 1:2) matdt[Var1 == i & Var2 == i, grp := paste0("clust", i)]
+
+p <- ggplot(matdt[grp != "diff"]) +
+  geom_point(aes(x = region1, y = -region2, color = grp), shape = 15) +
+  theme_void() +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+ggsave(filename = "test6_1.jpg", plot = p, device = "jpeg", height = 20, width = 20, units = "in")
+```
+
+```{r}
+library(kernlab)
+
+sc <- specc(corM_scaled, centers = 5)
+
+
+matdt <- as.data.table(expand.grid(c(sc), c(sc)))
+matdt <- matdt[, region1 := rep(1:dim(M)[1], dim(M)[1])]
+matdt <- matdt[, region2 := rep(1:dim(M)[1], each = dim(M)[1])]
+matdt[Var1 != Var2, grp := "diff"]
+for (i in 1:5) matdt[Var1 == i & Var2 == i, grp := paste0("clust", i)]
+
+p <- ggplot(matdt[grp != "diff"]) +
+  geom_point(aes(x = region1, y = -region2, color = grp), shape = 15) +
+  theme_void() +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Spectral")
+
+ggsave(filename = "test6_1.jpg", plot = p, device = "jpeg", height = 20, width = 20, units = "in")
+
+regions <- bin_ends[, .(start = as.integer(c(1, end + 1)[1:length(end)]), end), by = chr]
+regions <- regions[1:chr_idx[chr == "chr22", last]]
+regions <- regions[-lowsignal]
+regions <- cbind(regions, as.factor(sc))
+setnames(regions, "V2", "compartment")
+
+fwrite(regions, "../hic_clusters_NEW.txt", sep = "\t")
+```
+
+***
+
+## TADS
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+rescale <- function(v, from, to) {
+  (to - from) * (v - max(v)) / (max(v) - min(v)) + 1
+}
+
+iterCorrection <- function(M, max_iter = 200, threshold = 1e-05) {
+  m <- dim(M)[1]
+  bias <- rep(1, m)
+  old_bias_change <- bias
+  
+  for (i in 1:max_iter) {
+    
+    sums <- rowSums(M)
+    bias_change <- sums/mean(sums)
+    bias_change[bias_change == 0] <- 1
+    M <- M / (bias_change %*% t(bias_change))
+    bias <- bias * bias_change
+    
+    if (i == max_iter) {
+      message(paste0("Did not converge in ", max_iter, " iterations"))
+      break
+    }
+    
+    if (sum(abs(bias_change - old_bias_change), na.rm = TRUE) < threshold) {
+      message(paste0("Converged in ", i, " iterations"))
+      break
+    }
+    
+    old_bias_change <- bias_change
+  }
+  
+  return(M)
+}
+
+calltads <- function(M) {
+  L <- igraph::graph_from_adjacency_matrix(M, weighted = TRUE, mode = "upper")
+  L <- igraph::laplacian_matrix(L, normalized = TRUE)
+  decomp <- eigen(L)
+  
+  fiedler <- decomp$vectors[, length(decomp$values) - which(diff(round(sort(decomp$values), 8) > 0) == 1)]
+  tads <- rleid(fiedler >= 0)
+  
+  tads <- as.data.table(tads)
+  tads <- tads[, .N, .(tad_id = tads)][, .(tad_id, N, tad_end = cumsum(N))]
+  tads[, tad_start := as.integer(tad_end - N + 1)]
+  return(tads)
+}
+
+findTads <- function(m, chroms, threshold) {
+  
+  for (i in c(chroms)) {
+    M <- as.matrix(m[chr_idx[chr == paste0("chr", i), seq(first, last)], .SD, .SDcols = chr_idx[chr == paste0("chr", i), seq(first, last)]])
+    
+    M[M > quantile(M, 0.99, na.rm = TRUE)] <- quantile(M, 0.99, na.rm = TRUE)
+    colvars <- as.data.table(M)[, sapply(.SD, function(x) var(x, na.rm = TRUE))]
+    lowsignal <- which(colvars < quantile(colvars, 0.02, na.rm = TRUE))
+    M <- M[-lowsignal, -lowsignal]
+    
+    M <- iterCorrection(M)
+    mat <- data.table(count = c(cor(M)),
+                      region1 = rep(1:dim(M)[1], dim(M)[1]),
+                      region2 = rep(1:dim(M)[1], each = dim(M)[1]))
+    M <- log(M + 1)
+    
+    tads <- calltads(M)
+    indices <- which(tads[, tad_end - tad_start] > threshold)
+    while (length(indices) > 0) {
+        j <- indices[1]
+        id <- tads[j, tad_id]
+        newtads <- calltads(M[tads[j, seq(tad_start, tad_end)], tads[j, seq(tad_start, tad_end)]])
+        newtads[, tad_start := tad_start + tads[j, tad_start] - 1]
+        newtads[, tad_end := tad_end + tads[j, tad_start] - 1]
+        newtads[, tad_id := id]
+        tads <- rbind(newtads, tads[-j])
+        indices <- which(tads[, tad_end - tad_start] > threshold)
+      }
+    
+    b <- ggplot() +
+      geom_tile(data = mat, aes(x = region1, y = -region2, fill = count)) +
+      geom_segment(data = tads, aes(x = tad_end, xend = tad_end, y = -tad_start, yend = -tad_end), size = 0.3, colour = "blue") +
+      geom_segment(data = tads, aes(x = tad_start, xend = tad_end, y = -tad_start, yend = -tad_start), size = 0.3, colour = "blue") +
+      # geom_segment(data = tads, aes(x = tad_start, xend = tad_start, y = -tad_start, yend = -tad_end), size = 0.3, colour = "blue") +
+      # geom_segment(data = tads, aes(x = tad_start, xend = tad_end, y = -tad_end, yend = -tad_end), size = 0.3, colour = "blue") +
+      theme_void() +
+      # scale_fill_gradientn(colours = c("#f7f7f7", "red")) +
+      scale_fill_gradientn(colours = c("#010f36", "firebrick3", "#faeae8")) +
+      theme(legend.position = "none")
+    
+    ggsave(filename = paste0("chr_maps/tadtest_chr", i, "_cortest.jpg"), plot = b, device = "jpg",
+           height = 10, width = 10, dpi = 300, units = "in", limitsize = FALSE)
+  
+  }
+}
+
+bin_ends <- fread("jurkat_binends_100K.txt")
+chr_idx <- bin_ends[, .(last = .N), chr]
+chr_idx[, last := cumsum(last)]
+chr_idx[, first := c(1, last[1:23] + 1)]
+setcolorder(chr_idx, c("chr", "first", "last"))
+
+m <- fread("jurkat_ALL_100K.txt", header = FALSE)
+findTads(m, c(11), 100)
+```
+
+***
+
+## COMPARTMENTS
+
+```{r}
+library(data.table)
+library(ggplot2)
+set.seed(1)
+
+iterCorrection <- function(M, max_iter = 200, threshold = 1e-06) {
+  m <- dim(M)[1]
+  bias <- rep(0, m)
+  old_bias_change <- bias
+  
+  for (i in 1:max_iter) {
+    
+    sums <- rowSums(M, na.rm = TRUE)
+    bias_change <- sums/mean(sums, na.rm = TRUE)
+    bias_change[bias_change == 0] <- 1
+    M <- M / (bias_change %*% t(bias_change))
+    bias <- bias * bias_change
+    
+    if (i == max_iter) {
+      message(paste0("Did not converge in ", max_iter, " iterations"))
+      break
+    }
+    
+    if (sum(abs(bias_change - old_bias_change), na.rm = TRUE) < threshold) {
+      message(paste0("Converged in ", i, " iterations"))
+      break
+    }
+    
+    old_bias_change <- bias_change
+  }
+  
+  return(M)
+}
+
+bin_ends <- fread("interchr_bin_ends_500kb.txt")
+chr_idx <- bin_ends[, .(last = .N), chr]
+chr_idx[, last := cumsum(last)]
+chr_idx[, first := c(1, last[1:23] + 1)]
+setcolorder(chr_idx, c("chr", "first", "last"))
+chr_idx <- chr_idx[1:22]
+regions <- chr_idx[, .(idx = seq(first, last)), by = chr]
+
+m <- fread("contacts_500kb.txt", header = FALSE)
+
+M <- as.matrix(m)
+M <- M[regions$idx, regions$idx]
+M[M > quantile(M, 0.9, na.rm = TRUE)] <- quantile(M, 0.9, na.rm = TRUE)
+M <- iterCorrection(M)
+colvars <- as.data.table(M)[, sapply(.SD, function(x) var(x, na.rm = TRUE))]
+lowsignal <- which(colvars < quantile(colvars, 0.02, na.rm = TRUE))
+
+regions <- regions[-lowsignal]
+even <- regions[chr %in% paste0("chr", seq(2, 22, 2))]
+odd <- regions[chr %in% paste0("chr", seq(1, 21, 2))]
+M <- M[odd$idx, even$idx]
+
+zerocols <- as.data.table(M)[, sapply(.SD, function(x) sum(x == 0) > 0.2*length(x))]
+zerorows <- as.data.table(t(M))[, sapply(.SD, function(x) sum(x == 0) > 0.2*length(x))]
+M <- M[-which(zerorows), -which(zerocols)]
+oldM <- copy(M)
+
+# pheatmap::pheatmap(M, cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+#                    width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "raotest.jpg",
+#                    color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+row_kclust <- kmeans(oldM, centers = 6)
+row_cl <- row_kclust$cluster
+row_clusts <- c()
+
+for (i in 1:6) {
+  row_clusts <- c(row_clusts, which(row_cl == i))
+}
+
+pheatmap::pheatmap(oldM[row_clusts, ], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "clustrow.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+col_kclust <- kmeans(t(M), centers = 6)
+col_cl <- col_kclust$cluster
+
+col_clusts <- c()
+for (i in 1:6) {
+  col_clusts <- c(col_clusts, which(col_cl == i))
+}
+
+pheatmap::pheatmap(t(M)[col_clusts, ], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "clustcol.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+
+pheatmap::pheatmap(oldM[row_clusts, col_clusts], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "clustest.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+    
+scores <- matrix(nrow = 6, ncol = 6)
+for (i in 1:6) {
+  for (j in 1:6) {
+    x <- which(row_cl == i)
+    y <- which(col_cl == j)
+    subM <- log(oldM[x, y] + 1)
+    scores[i, j] <- mean(subM)
+  }
+}
+    
+
+row_sums <- rowSums(scores)
+col_sums <- colSums(scores)
+    
+scores <- scores/row_sums
+scores <- t(t(scores)/col_sums)
+    
+scores <- as.matrix(as.data.table(scores)[, lapply(.SD, function(x) x/max(x))])
+
+pheatmap::pheatmap(scale(scores), cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = FALSE, show_colnames = FALSE)
+
+##################################################################################################################################
+# clust4M <- log(M + 1)[which(row_cl == 4), which(col_cl == 4)]
+# 
+# clust4kmeans_row <- kmeans(clust4M, centers = 4)
+# row_cl4 <- clust4kmeans_row$cluster
+# row_clusts4 <- c()
+# for (i in 1:4) {
+#   row_clusts4 <- c(row_clusts4, which(row_cl4 == i))
+# }
+# pheatmap::pheatmap(clust4M[row_clusts4, ], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+#                    width = 5, height = 5, silent = FALSE, legend = FALSE, border_color = NA, file = "clust4_row.jpg",
+#                    color = colorRampPalette(c("#f7f7f7", "red"))(50))
+# 
+# clust4kmeans_col <- kmeans(t(clust4M), centers = 4)
+# col_cl4 <- clust4kmeans_col$cluster
+# col_clusts4 <- c()
+# for (i in 1:4) {
+#   col_clusts4 <- c(col_clusts4, which(col_cl4 == i))
+# }
+# pheatmap::pheatmap(clust4M[, col_clusts4], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+#                    width = 5, height = 5, silent = FALSE, legend = FALSE, border_color = NA, file = "clust4_col.jpg",
+#                    color = colorRampPalette(c("#f7f7f7", "red"))(50))
+# 
+# pheatmap::pheatmap(clust4M[row_clusts4, col_clusts4], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+#                    width = 5, height = 5, silent = FALSE, legend = FALSE, border_color = NA, file = "clust4.jpg",
+#                    color = colorRampPalette(c("#f7f7f7", "red"))(50))
+# 
+# scores_cl4 <- matrix(nrow = 4, ncol = 4)
+# for (i in 1:4) {
+#   for (j in 1:4) {
+#     x <- which(row_cl4 == i)
+#     y <- which(col_cl4 == j)
+#     subM <- log(M[x, y] + 1)
+#     scores_cl4[i, j] <- mean(subM)
+#   }
+# }
+#     
+# 
+# row_sums_cl4 <- rowSums(scores_cl4)
+# col_sums_cl4 <- colSums(scores_cl4)
+#     
+# scores_cl4 <- scores_cl4/row_sums_cl4
+# scores_cl4 <- t(t(scores_cl4)/col_sums_cl4)
+#     
+# scores_cl4 <- as.matrix(as.data.table(scores_cl4)[, lapply(.SD, function(x) x/max(x))])
+# 
+# pheatmap::pheatmap(scale(scores_cl4), cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = FALSE, show_colnames = FALSE)
+##################################################################################################################################
+
+oddidx <- odd[-which(zerorows)]
+evenidx <- even[-which(zerocols)]
+indices <- rbind(oddidx, evenidx)
+
+compartments <- bin_ends[indices$idx]
+compartments[chr %in% paste0("chr", seq(1, 21, 2)), parity := "odd"]
+compartments[chr %in% paste0("chr", seq(2, 22, 2)), parity := "even"]
+
+compartments[parity == "odd", clust := row_cl]
+compartments[parity == "even", clust := col_cl]
+
+compartments[(parity == "odd" & clust == 1) | (parity == "even" & clust == 1), compartment := "clust1"]
+compartments[(parity == "odd" & clust == 2) | (parity == "even" & clust == 2), compartment := "clust2"]
+compartments[(parity == "odd" & clust == 3) | (parity == "even" & clust == 3), compartment := "clust3"]
+compartments[(parity == "odd" & clust == 4) | (parity == "even" & clust == 5), compartment := "clust4"]
+compartments[(parity == "odd" & clust == 5) | (parity == "even" & clust == 4), compartment := "clust5"]
+compartments[(parity == "odd" & clust == 6) | (parity == "even" & clust == 6), compartment := "clust6"]
+
+compartments <- compartments[, .(start = as.integer(c(1, end + 1)[1:length(end)]), end, compartment), by = chr]
+
+fwrite(compartments, "../hic_clusters_NEWEST.txt", sep = "\t")
+```
+
+***
+
+## COR EVEN ODD CLUSTERS
+
+```{r}
+library(data.table)
+library(ggplot2)
+set.seed(69)
+
+iterCorrection <- function(M, max_iter = 300, threshold = 1e-06) {
+  m <- dim(M)[1]
+  bias <- rep(0, m)
+  old_bias_change <- bias
+  
+  for (i in 1:max_iter) {
+    
+    sums <- rowSums(M, na.rm = TRUE)
+    bias_change <- sums/mean(sums, na.rm = TRUE)
+    bias_change[bias_change == 0] <- 1
+    M <- M / (bias_change %*% t(bias_change))
+    bias <- bias * bias_change
+    
+    if (i == max_iter) {
+      message(paste0("Did not converge in ", max_iter, " iterations"))
+      break
+    }
+    
+    if (sum(abs(bias_change - old_bias_change), na.rm = TRUE) < threshold) {
+      message(paste0("Converged in ", i, " iterations"))
+      break
+    }
+    
+    old_bias_change <- bias_change
+  }
+  
+  return(M)
+}
+
+bin_ends <- fread("jurkat_binends_500K.txt")
+chr_idx <- bin_ends[, .(last = .N), chr]
+chr_idx[, last := cumsum(last)]
+chr_idx[, first := c(1, last[1:23] + 1)]
+setcolorder(chr_idx, c("chr", "first", "last"))
+chr_idx <- chr_idx[1:22]
+regions <- chr_idx[, .(idx = seq(first, last)), by = chr]
+
+for (i in 1:7) {
+  m <- fread(paste0("jurkat_ALL_500K_", i, ".txt"), header = FALSE)
+  if (i == 1) M <- as.matrix(m[1:chr_idx[chr == "chr22", last], 1:chr_idx[chr == "chr22", last]])
+  else M <- M + as.matrix(m[1:chr_idx[chr == "chr22", last], 1:chr_idx[chr == "chr22", last]])
+}
+
+M <- as.matrix(m)
+M <- M[regions$idx, regions$idx]
+M[M > quantile(M, 0.9, na.rm = TRUE)] <- quantile(M, 0.9, na.rm = TRUE)
+M <- iterCorrection(M)
+colvars <- as.data.table(M)[, sapply(.SD, function(x) var(x, na.rm = TRUE))]
+lowsignal <- which(colvars < quantile(colvars, 0.02, na.rm = TRUE))
+
+regions <- regions[-lowsignal]
+even <- regions[chr %in% paste0("chr", seq(2, 22, 2))]
+odd <- regions[chr %in% paste0("chr", seq(1, 21, 2))]
+
+corM <- cor(M)
+corM <- corM[odd$idx, even$idx]
+
+pheatmap::pheatmap(corM, cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "raotest2.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+row_kclust <- kmeans(corM, centers = 5)
+row_cl <- row_kclust$cluster
+row_clusts <- c()
+
+for (i in 1:5) {
+  row_clusts <- c(row_clusts, which(row_cl == i))
+}
+
+pheatmap::pheatmap(corM[row_clusts, ], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "cor_new_clustrow.jpg",
+                  color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+col_kclust <- kmeans(t(corM), centers = 5)
+col_cl <- col_kclust$cluster
+
+col_clusts <- c()
+for (i in 1:5) {
+  col_clusts <- c(col_clusts, which(col_cl == i))
+}
+
+pheatmap::pheatmap(t(corM)[col_clusts, ], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "cor_new_clustcol.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+
+
+pheatmap::pheatmap(corM[row_clusts, col_clusts], cluster_cols = FALSE, cluster_rows = FALSE, show_rownames = FALSE, show_colnames = FALSE,
+                   width = 10, height = 10, silent = FALSE, legend = FALSE, border_color = NA, file = "cor_new_clustest.jpg",
+                   color = colorRampPalette(c("#f7f7f7", "red"))(50))
+    
+scores <- matrix(nrow = 5, ncol = 5)
+for (i in 1:5) {
+  for (j in 1:5) {
+    x <- which(row_cl == i)
+    y <- which(col_cl == j)
+    subM <- corM[x, y]
+    scores[i, j] <- sum(subM)/(nrow(subM)*ncol(subM))
+  }
+}
+
+pheatmap::pheatmap(scale(scores), cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = FALSE, show_colnames = FALSE)
+
+
+oddidx <- odd
+evenidx <- even
+indices <- rbind(oddidx, evenidx)
+
+compartments <- bin_ends[indices$idx]
+compartments[chr %in% paste0("chr", seq(1, 21, 2)), parity := "odd"]
+compartments[chr %in% paste0("chr", seq(2, 22, 2)), parity := "even"]
+
+compartments[parity == "odd", clust := row_cl]
+compartments[parity == "even", clust := col_cl]
+
+compartments[(parity == "odd" & clust == 1) | (parity == "even" & clust == 1), compartment := "clust1"]
+compartments[(parity == "odd" & clust == 2) | (parity == "even" & clust == 4), compartment := "clust2"]
+compartments[(parity == "odd" & clust == 3) | (parity == "even" & clust == 2), compartment := "clust3"]
+compartments[(parity == "odd" & clust == 4) | (parity == "even" & clust == 3), compartment := "clust4"]
+compartments[(parity == "odd" & clust == 5) | (parity == "even" & clust == 5), compartment := "clust5"]
+
+compartments <- compartments[, .(start = as.integer(c(1, end + 1)[1:length(end)]), end, compartment), by = chr]
+
+# fwrite(compartments, "../hic_clusters_COR_new.txt", sep = "\t")
+```
+
